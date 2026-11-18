@@ -1,0 +1,4 @@
+build-src/
+*.pgm
+*.png
+*.variant

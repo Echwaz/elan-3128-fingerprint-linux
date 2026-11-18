@@ -1,0 +1,1134 @@
+diff --git a/libfprint/drivers/elanspi.c b/libfprint/drivers/elanspi.c
+index 9338013..c8d8a80 100644
+--- a/libfprint/drivers/elanspi.c
++++ b/libfprint/drivers/elanspi.c
+@@ -733,6 +733,14 @@ elanspi_capture_hv_image_handler (FpiSpiTransfer *transfer, FpDevice *dev, gpoin
+ }
+ 
+ 
++static GCancellable *
++elanspi_get_safe_cancellable (FpDevice *dev)
++{
++  if (fpi_device_get_current_action (dev) != FPI_DEVICE_ACTION_NONE)
++    return fpi_device_get_cancellable (dev);
++  return NULL;
++}
++
+ static void
+ elanspi_capture_hv_handler (FpiSsm *ssm, FpDevice *dev)
+ {
+@@ -749,13 +757,13 @@ elanspi_capture_hv_handler (FpiSsm *ssm, FpDevice *dev)
+       xfer->ssm = ssm;
+       /* these are specifically cancellable because they don't leave the device at some aribtrary line offset, since
+        * these devices only send entire images */
+-      fpi_spi_transfer_submit (xfer, fpi_device_get_cancellable (dev), fpi_ssm_spi_transfer_cb, NULL);
++      fpi_spi_transfer_submit (xfer, elanspi_get_safe_cancellable (dev), fpi_ssm_spi_transfer_cb, NULL);
+       return;
+ 
+     case ELANSPI_CAPTHV_CHECK_READY:
+       xfer = elanspi_read_status (self, &self->sensor_status);
+       xfer->ssm = ssm;
+-      fpi_spi_transfer_submit (xfer, fpi_device_get_cancellable (dev), fpi_ssm_spi_transfer_cb, NULL);
++      fpi_spi_transfer_submit (xfer, elanspi_get_safe_cancellable (dev), fpi_ssm_spi_transfer_cb, NULL);
+       return;
+ 
+     case ELANSPI_CAPTHV_RECV_IMAGE:
+@@ -780,7 +788,7 @@ elanspi_capture_hv_handler (FpiSsm *ssm, FpDevice *dev)
+       fpi_spi_transfer_write (xfer, 2);
+       xfer->buffer_wr[0] = 0x10;                   /* receieve line */
+       fpi_spi_transfer_read (xfer, self->sensor_height * (self->sensor_width * 2 + 48));
+-      fpi_spi_transfer_submit (xfer, fpi_device_get_cancellable (dev), elanspi_capture_hv_image_handler, NULL);
++      fpi_spi_transfer_submit (xfer, elanspi_get_safe_cancellable (dev), elanspi_capture_hv_image_handler, NULL);
+       return;
+     }
+ }
+@@ -1137,9 +1145,43 @@ do_sw_reset:
+       return;
+ 
+     case ELANSPI_INIT_BG_SAVE:
+-      memcpy (self->bg_image, self->last_image, self->sensor_height * self->sensor_width * 2);
+-      fpi_ssm_mark_completed (ssm);
+-      return;
++      {
++        gsize bg_bytes = (gsize) self->sensor_height * self->sensor_width * 2;
++        memcpy (self->bg_image, self->last_image, bg_bytes);
++
++        g_autofree gchar *cached_buf = NULL;
++        gsize cached_len = 0;
++        if (g_file_get_contents ("/var/lib/fprint/elanspi_calib.bin", &cached_buf, &cached_len, NULL) &&
++            cached_len == bg_bytes)
++          {
++            const guint16 *cached_bg = (const guint16 *) cached_buf;
++            gint64 diff_sum = 0, diff_sq = 0;
++            gsize npix = (gsize) self->sensor_height * self->sensor_width;
++            for (gsize i = 0; i < npix; i++)
++              {
++                gint64 d = (gint64) self->last_image[i] - (gint64) cached_bg[i];
++                diff_sum += d;
++                diff_sq += d * d;
++              }
++            gint64 diff_var = (diff_sq - (diff_sum * diff_sum) / (gint64) npix) / (gint64) npix;
++            if (diff_var > ELANSPI_MAX_EMPTY_STDDEV)
++              {
++                fp_dbg ("<init/bg> finger detected on sensor during init (diff_var=%" G_GINT64_FORMAT "), using cached clean bg", diff_var);
++                memcpy (self->bg_image, cached_bg, bg_bytes);
++              }
++            else
++              {
++                g_file_set_contents ("/var/lib/fprint/elanspi_calib.bin", (const gchar *) self->bg_image, bg_bytes, NULL);
++              }
++          }
++        else
++          {
++            g_file_set_contents ("/var/lib/fprint/elanspi_calib.bin", (const gchar *) self->bg_image, bg_bytes, NULL);
++          }
++
++        fpi_ssm_mark_completed (ssm);
++        return;
++      }
+     }
+ }
+ 
+@@ -1323,43 +1365,169 @@ elanspi_process_frame (FpiDeviceElanSpi *self, const guint16 *data_in, guint8 *d
+     }
+ }
+ 
+-static unsigned char
++static G_GNUC_UNUSED unsigned char
+ elanspi_fp_assembling_get_pixel (struct fpi_frame_asmbl_ctx *ctx, struct fpi_frame *frame, unsigned int x, unsigned int y)
+ {
+   return frame->data[y * ctx->frame_width + x];
+ }
+ 
++/* Separable gaussian smoothing pass (sigma ~1.2, radius 3). Suppresses
++ * sensor-noise speckle that otherwise produces spurious, non-repeatable
++ * image features on the eFSA80SC. */
++static void
++elanspi_smooth_image (FpImage *img)
++{
++  /* gaussian kernel, sigma=1.2 */
++  static const guint kern[7] = { 34, 111, 218, 298, 218, 111, 34 };
++  guint w = img->width, h = img->height;
++  g_autofree guint8 *tmp = g_malloc (w * h);
++  guint8 *data = (guint8 *) img->data;
++
++  for (guint y = 0; y < h; y++)
++    for (guint x = 0; x < w; x++)
++      {
++        guint acc = 0, wsum = 0;
++        for (gint k = -3; k <= 3; k++)
++          {
++            gint xx = (gint) x + k;
++            if (xx < 0 || xx >= (gint) w)
++              continue;
++            acc += kern[k + 3] * data[y * w + xx];
++            wsum += kern[k + 3];
++          }
++        tmp[y * w + x] = acc / wsum;
++      }
++  for (guint y = 0; y < h; y++)
++    for (guint x = 0; x < w; x++)
++      {
++        guint acc = 0, wsum = 0;
++        for (gint k = -3; k <= 3; k++)
++          {
++            gint yy = (gint) y + k;
++            if (yy < 0 || yy >= (gint) h)
++              continue;
++            acc += kern[k + 3] * tmp[yy * w + x];
++            wsum += kern[k + 3];
++          }
++        data[y * w + x] = acc / wsum;
++      }
++}
++
++/* Compute row-dehummed ridge contrast variance so 50Hz mains banding does not inflate variance */
++static gint64
++elanspi_frame_ridge_variance (const guint8 *data, guint w, guint h)
++{
++  gint64 total_var = 0;
++
++  for (guint y = 0; y < h; y++)
++    {
++      gint64 rsum = 0, rsq = 0;
++      const guint8 *row = data + y * w;
++      for (guint x = 0; x < w; x++)
++        {
++          rsum += row[x];
++          rsq += (gint64) row[x] * row[x];
++        }
++      total_var += rsq - (rsum * rsum) / (gint64) w;
++    }
++  return total_var / (gint64) h;
++}
++
++static gboolean
++elanspi_frames_aligned (const guint8 *a, const guint8 *b, guint w, guint h)
++{
++  gint64 num = 0, da2 = 0, db2 = 0;
++
++  for (guint y = 0; y < h; y++)
++    {
++      gint64 ma = 0, mb = 0;
++      const guint8 *ra = a + y * w;
++      const guint8 *rb = b + y * w;
++      for (guint x = 0; x < w; x++)
++        {
++          ma += ra[x];
++          mb += rb[x];
++        }
++      ma /= w;
++      mb /= w;
++      for (guint x = 0; x < w; x++)
++        {
++          gint64 va = (gint64) ra[x] - ma;
++          gint64 vb = (gint64) rb[x] - mb;
++          num += va * vb;
++          da2 += va * va;
++          db2 += vb * vb;
++        }
++    }
++  if (da2 <= 0 || db2 <= 0 || num <= 0)
++    return FALSE;
++  /* correlation >= 0.80 <=> num^2 >= 0.64 * da2 * db2 */
++  return ((double) num * (double) num) >= (0.64 * (double) da2 * (double) db2);
++}
++
++#define ELANSPI_PRESS_CAPTURE_FRAMES 5
++
+ static void
+ elanspi_fp_frame_stitch_and_submit (FpiDeviceElanSpi *self)
+ {
+   g_autoptr(FpImage) img = NULL;
+-  g_autoptr(FpImage) scaled = NULL;
+-  struct fpi_frame_asmbl_ctx assembling_ctx = {
+-    .image_width = (self->frame_width * 3) / 2,
++  guint w = self->frame_width;
++  guint h = self->frame_height;
++  gsize fsz = (gsize) w * h;
++  struct fpi_frame *best = NULL;
++  gint64 best_var = -1;
+ 
+-    .frame_width = self->frame_width,
+-    .frame_height = self->frame_height,
++  for (GSList *l = self->fp_frame_list; l != NULL; l = l->next)
++    {
++      struct fpi_frame *f = l->data;
++      gint64 var = elanspi_frame_ridge_variance (f->data, w, h);
++      if (var > best_var)
++        {
++          best_var = var;
++          best = f;
++        }
++    }
+ 
+-    .get_pixel = elanspi_fp_assembling_get_pixel,
+-  };
++  img = fp_image_new (w, h);
++  if (best)
++    {
++      g_autofree guint32 *accum = g_malloc0 (fsz * sizeof (guint32));
++      guint32 weight_sum = 2;
+ 
+-  /* stitch image */
+-  GSList *frame_start = g_slist_nth (self->fp_frame_list, ELANSPI_SWIPE_FRAMES_DISCARD);
++      for (gsize k = 0; k < fsz; k++)
++        accum[k] = (guint32) best->data[k] * 2;
+ 
+-  fpi_do_movement_estimation (&assembling_ctx, frame_start);
+-  img = fpi_assemble_frames (&assembling_ctx, frame_start);
+-  scaled = fpi_image_resize (img, 2, 2);
++      for (GSList *l = self->fp_frame_list; l != NULL; l = l->next)
++        {
++          struct fpi_frame *f = l->data;
++          if (f == best)
++            continue;
++          if (elanspi_frames_aligned (best->data, f->data, w, h))
++            {
++              for (gsize k = 0; k < fsz; k++)
++                accum[k] += f->data[k];
++              weight_sum += 1;
++            }
++        }
++
++      for (gsize k = 0; k < fsz; k++)
++        img->data[k] = (guint8) (accum[k] / weight_sum);
++
++      fp_dbg ("<press> picked best frame (ridge_var=%" G_GINT64_FORMAT "), averaged %u aligned frames",
++              best_var, weight_sum - 1);
++    }
+ 
+-  scaled->flags |= FPI_IMAGE_PARTIAL | FPI_IMAGE_COLORS_INVERTED;
++  elanspi_smooth_image (img);
++  img->flags |= FPI_IMAGE_COLORS_INVERTED;
+ 
+   /* submit image */
+-  fpi_image_device_image_captured (FP_IMAGE_DEVICE (self), g_steal_pointer (&scaled));
++  fpi_image_device_image_captured (FP_IMAGE_DEVICE (self), g_steal_pointer (&img));
+ 
+   /* clean out frame data */
+   g_slist_free_full (g_steal_pointer (&self->fp_frame_list), g_free);
+ }
+ 
+-static gint64
++static G_GNUC_UNUSED gint64
+ elanspi_get_frame_diff_stddev_sq (FpiDeviceElanSpi *self, guint16 *frame1, guint16 *frame2)
+ {
+   gint64 mean = 0;
+@@ -1382,11 +1550,45 @@ elanspi_get_frame_diff_stddev_sq (FpiDeviceElanSpi *self, guint16 *frame1, guint
+   return sq_stddev;
+ }
+ 
++#define ELANSPI_PRESS_CAPTURE_FRAMES 5
++
+ static void
+-elanspi_fp_frame_handler (FpiSsm *ssm, FpiDeviceElanSpi *self)
++elanspi_jump_to_state_hv_delay (FpiSsm *ssm, FpiDeviceElanSpi *self, int state)
++{
++  if (self->sensor_id == 0xe)
++    fpi_ssm_jump_to_state_delayed (ssm, state, ELANSPI_HV_SENSOR_FRAME_DELAY);
++  else
++    fpi_ssm_jump_to_state (ssm, state);
++}
++
++static void
++elanspi_append_current_frame (FpiDeviceElanSpi *self)
++{
++  struct fpi_frame *this_frame = g_malloc0 (self->sensor_height * self->sensor_width + sizeof (struct fpi_frame));
++  elanspi_correct_with_bg (self, self->last_image);
++  elanspi_process_frame (self, self->last_image, this_frame->data);
++  self->fp_frame_list = g_slist_prepend (self->fp_frame_list, this_frame);
++  memcpy (self->prev_frame_image, self->last_image, self->sensor_height * self->sensor_width * 2);
++}
++
++static void
++elanspi_complete_press_scan (FpiSsm *ssm, FpiDeviceElanSpi *self)
+ {
+-  g_autofree struct fpi_frame *this_frame = NULL;
++  /* Complete the SSM first so self->capturing becomes FALSE before any new
++   * SSM can be started by report_finger_status. */
++  fpi_ssm_mark_completed (ssm);
+ 
++  if (self->fp_frame_list != NULL)
++    elanspi_fp_frame_stitch_and_submit (self);
++  else
++    fpi_image_device_retry_scan (FP_IMAGE_DEVICE (self), FP_DEVICE_RETRY_TOO_SHORT);
++
++  fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (self), FALSE);
++}
++
++static void
++elanspi_fp_frame_handler (FpiSsm *ssm, FpiDeviceElanSpi *self)
++{
+   switch (elanspi_guess_image (self, self->last_image))
+     {
+     case ELANSPI_GUESS_UNKNOWN:
+@@ -1395,80 +1597,32 @@ elanspi_fp_frame_handler (FpiSsm *ssm, FpiDeviceElanSpi *self)
+ 
+     case ELANSPI_GUESS_EMPTY:
+       self->fp_empty_counter += 1;
+-      fp_dbg ("<fp_frame> got empty");
+-      if (self->fp_empty_counter > 1)
++      fp_dbg ("<fp_frame> got empty (%d)", self->fp_empty_counter);
++      if (self->fp_empty_counter >= ELANSPI_MIN_FRAMES_DEBOUNCE)
+         {
+-          fp_dbg ("<fp_frame> have enough debounce");
+-          if (g_slist_length (self->fp_frame_list) >= ELANSPI_MIN_FRAMES_SWIPE)
+-            {
+-              fp_dbg ("<fp_frame> have enough frames, submitting");
+-              elanspi_fp_frame_stitch_and_submit (self);
+-            }
+-          else
+-            {
+-              fp_dbg ("<fp_frame> not enough frames, reporting short swipe");
+-              fpi_image_device_retry_scan (FP_IMAGE_DEVICE (self), FP_DEVICE_RETRY_TOO_SHORT);
+-            }
+-          goto finish_capture;
++          fp_dbg ("<fp_frame> finger lifted during capture with %u frames, completing",
++                  g_slist_length (self->fp_frame_list));
++          elanspi_complete_press_scan (ssm, self);
++          return;
+         }
+       break;
+ 
+     case ELANSPI_GUESS_FINGERPRINT:
+-      if (self->fp_empty_counter && self->fp_frame_list)
+-        {
+-          if (self->fp_empty_counter < 1)
+-            {
+-              fp_dbg ("<fp_frame> possible bounced fp");
+-              break;
+-            }
+-          else
+-            {
+-              fp_dbg ("<fp_frame> too many empties, clearing list");
+-              g_slist_free_full (g_steal_pointer (&self->fp_frame_list), g_free);
+-              self->fp_empty_counter = 0;
+-            }
+-        }
+-
+-      if (g_slist_length (self->fp_frame_list) > ELANSPI_MAX_FRAMES_SWIPE)
+-        {
+-          fp_dbg ("<fp_frame> have enough frames, exiting now");
+-          elanspi_fp_frame_stitch_and_submit (self);
+-          goto finish_capture;
+-        }
+-
+-      /* append image */
+-      this_frame = g_malloc0 (self->sensor_height * self->sensor_width + sizeof (struct fpi_frame));
+-      elanspi_correct_with_bg (self, self->last_image);
+-      elanspi_process_frame (self, self->last_image, this_frame->data);
++      self->fp_empty_counter = 0;
++      elanspi_append_current_frame (self);
+ 
+-      if (self->fp_frame_list)
++      if (g_slist_length (self->fp_frame_list) >= ELANSPI_PRESS_CAPTURE_FRAMES)
+         {
+-          gint difference = elanspi_get_frame_diff_stddev_sq (self, self->last_image, self->prev_frame_image);
+-          fp_dbg ("<fp_frame> diff = %d", difference);
+-          if (difference < ELANSPI_MIN_FRAME_TO_FRAME_DIFF)
+-            {
+-              fp_dbg ("<fp_frame> ignoring b.c. difference is too small");
+-              break;
+-            }
++          fp_dbg ("<fp_frame> collected %d press frames, waiting for finger lift",
++                  ELANSPI_PRESS_CAPTURE_FRAMES);
++          self->finger_wait_debounce = 0;
++          elanspi_jump_to_state_hv_delay (ssm, self, ELANSPI_FPCAPT_WAITUP_CAPTURE);
++          return;
+         }
+-      self->fp_frame_list = g_slist_prepend (self->fp_frame_list, g_steal_pointer (&this_frame));
+-      memcpy (self->prev_frame_image, self->last_image, self->sensor_height * self->sensor_width * 2);
+       break;
+     }
+ 
+-  if (self->sensor_id == 0xe)
+-    fpi_ssm_jump_to_state_delayed (ssm, ELANSPI_FPCAPT_FP_CAPTURE, ELANSPI_HV_SENSOR_FRAME_DELAY);
+-  else
+-    fpi_ssm_jump_to_state (ssm, ELANSPI_FPCAPT_FP_CAPTURE);
+-
+-  return;
+-
+-finish_capture:
+-  /* prepare for wait up */
+-  self->finger_wait_debounce = 0;
+-  fpi_ssm_jump_to_state (ssm, ELANSPI_FPCAPT_WAITUP_CAPTURE);
+-  return;
+-
++  elanspi_jump_to_state_hv_delay (ssm, self, ELANSPI_FPCAPT_FP_CAPTURE);
+ }
+ 
+ static void
+@@ -1514,7 +1668,7 @@ elanspi_fp_capture_ssm_handler (FpiSsm *ssm, FpDevice *dev)
+       if (!elanspi_check_waitupdown_done (self, ELANSPI_GUESS_FINGERPRINT))
+         {
+           /* take another image */
+-          fpi_ssm_jump_to_state (ssm, ELANSPI_FPCAPT_WAITDOWN_CAPTURE);
++          elanspi_jump_to_state_hv_delay (ssm, self, ELANSPI_FPCAPT_WAITDOWN_CAPTURE);
+           return;
+         }
+ 
+@@ -1523,11 +1677,12 @@ elanspi_fp_capture_ssm_handler (FpiSsm *ssm, FpDevice *dev)
+       g_slist_free_full (g_steal_pointer (&self->fp_frame_list), g_free);
+       self->fp_empty_counter = 0;
+ 
+-      /* report finger status */
++      /* report finger status and save the validated debounce frame as frame #1 */
+       fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (self), TRUE);
++      elanspi_append_current_frame (self);
+ 
+       /* jump */
+-      fpi_ssm_jump_to_state (ssm, ELANSPI_FPCAPT_FP_CAPTURE);
++      elanspi_jump_to_state_hv_delay (ssm, self, ELANSPI_FPCAPT_FP_CAPTURE);
+       return;
+ 
+     case ELANSPI_FPCAPT_FP_PROCESS:
+@@ -1538,17 +1693,11 @@ elanspi_fp_capture_ssm_handler (FpiSsm *ssm, FpDevice *dev)
+       if (!elanspi_check_waitupdown_done (self, ELANSPI_GUESS_EMPTY))
+         {
+           /* take another image */
+-          fpi_ssm_jump_to_state (ssm, ELANSPI_FPCAPT_WAITUP_CAPTURE);
++          elanspi_jump_to_state_hv_delay (ssm, self, ELANSPI_FPCAPT_WAITUP_CAPTURE);
+           return;
+         }
+ 
+-      /* Immediately set capturing to FALSE so that when report_finger_status tries to re-start
+-       * capturing in enroll we don't hit the assert since the old SSM is about to stop. */
+-      self->capturing = FALSE;
+-      fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (self), FALSE);
+-
+-      /* finish */
+-      fpi_ssm_mark_completed (ssm);
++      elanspi_complete_press_scan (ssm, self);
+       return;
+     }
+ }
+@@ -1639,9 +1788,14 @@ elanspi_fp_capture_finish (FpiSsm *ssm, FpDevice *dev, GError *error)
+       return;
+     }
+ 
+-  /* if there was an error, report it */
++  /* if there was an error, report it only if an action is still active */
+   if (error)
+-    fpi_image_device_session_error (idev, error);
++    {
++      if (fpi_device_get_current_action (dev) != FPI_DEVICE_ACTION_NONE)
++        fpi_image_device_session_error (idev, error);
++      else
++        g_error_free (error);
++    }
+ }
+ 
+ static void
+@@ -1698,10 +1852,11 @@ fpi_device_elanspi_class_init (FpiDeviceElanSpiClass *klass)
+   dev_class->full_name = "ElanTech Embedded Fingerprint Sensor";
+   dev_class->type = FP_DEVICE_TYPE_UDEV;
+   dev_class->id_table = elanspi_id_table;
+-  dev_class->scan_type = FP_SCAN_TYPE_SWIPE;
+-  dev_class->nr_enroll_stages = 7;       /* these sensors are very hit or miss, may as well record a few extras */
++  dev_class->scan_type = FP_SCAN_TYPE_PRESS;
++  dev_class->nr_enroll_stages = 8;
+ 
+-  img_class->bz3_threshold = 24;
++  img_class->algorithm = FPI_DEVICE_ALGO_SIGFM;
++  img_class->bz3_threshold = 450;
+   img_class->img_open = elanspi_open;
+   img_class->activate = elanspi_activate;
+   img_class->deactivate = elanspi_deactivate;
+diff --git a/libfprint/drivers/elanspi.h b/libfprint/drivers/elanspi.h
+index a8d7319..1dad921 100644
+--- a/libfprint/drivers/elanspi.h
++++ b/libfprint/drivers/elanspi.h
+@@ -340,7 +340,9 @@ static const struct elanspi_regtable elanspi_calibration_table_new_page1 = {
+ 
+ // using checkargs ACPI:HIDPID
+ static const FpIdEntry elanspi_id_table[] = {
++  {.udev_types = ELANSPI_UDEV_TYPES, .spi_acpi_id = "ELAN7001", .hid_id = {.vid = ELANSPI_TP_VID, .pid = 0x3128}, .driver_data = ELANSPI_180_ROTATE},
+   {.udev_types = ELANSPI_UDEV_TYPES, .spi_acpi_id = "ELAN7001", .hid_id = {.vid = ELANSPI_TP_VID, .pid = 0x3057}, .driver_data = ELANSPI_180_ROTATE},
++  {.udev_types = ELANSPI_UDEV_TYPES, .spi_acpi_id = "ELAN7001", .hid_id = {.vid = ELANSPI_TP_VID, .pid = 0x3104}, .driver_data = ELANSPI_90RIGHT_ROTATE},
+   {.udev_types = ELANSPI_UDEV_TYPES, .spi_acpi_id = "ELAN7001", .hid_id = {.vid = ELANSPI_TP_VID, .pid = 0x3087}, .driver_data = ELANSPI_180_ROTATE},
+   {.udev_types = ELANSPI_UDEV_TYPES, .spi_acpi_id = "ELAN7001", .hid_id = {.vid = ELANSPI_TP_VID, .pid = 0x30c6}, .driver_data = ELANSPI_180_ROTATE},
+   {.udev_types = ELANSPI_UDEV_TYPES, .spi_acpi_id = "ELAN70A1", .hid_id = {.vid = ELANSPI_TP_VID, .pid = 0x3134}, .driver_data = ELANSPI_90LEFT_ROTATE},
+@@ -371,7 +373,7 @@ static const FpIdEntry elanspi_id_table[] = {
+ #define ELANSPI_MIN_FRAMES_SWIPE (7 + ELANSPI_SWIPE_FRAMES_DISCARD)
+ #define ELANSPI_MAX_FRAMES_SWIPE (20 + ELANSPI_SWIPE_FRAMES_DISCARD)
+ 
+-#define ELANSPI_MAX_FRAME_HEIGHT 43
++#define ELANSPI_MAX_FRAME_HEIGHT 80
+ #define ELANSPI_MIN_FRAME_TO_FRAME_DIFF (250 * 250)
+ 
+ #define ELANSPI_HV_SENSOR_FRAME_DELAY 23
+@@ -379,4 +381,4 @@ static const FpIdEntry elanspi_id_table[] = {
+ #define ELANSPI_OTP_TIMEOUT_USEC (12 * 1000)
+ 
+ #define ELANSPI_OLD_CAPTURE_TIMEOUT_USEC (100 * 1000)
+-#define ELANSPI_HV_CAPTURE_TIMEOUT_USEC (50 * 1000)
++#define ELANSPI_HV_CAPTURE_TIMEOUT_USEC (150 * 1000)
+diff --git a/libfprint/fp-image.c b/libfprint/fp-image.c
+index 2303f6a..31e8ba4 100644
+--- a/libfprint/fp-image.c
++++ b/libfprint/fp-image.c
+@@ -320,11 +320,9 @@ fp_image_sigfm_extract_thread_func (GTask * task, void * src_obj,
+     {
+       g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_FAILED,
+                                "No enough keypoints found");
+-      g_object_unref (task);
+       return;
+     }
+   g_task_return_boolean (task, TRUE);
+-  g_object_unref (task);
+ }
+ 
+ static void
+@@ -521,7 +519,7 @@ void
+ fp_image_extract_sigfm_info (FpImage * self, GCancellable * cancellable,
+                            GAsyncReadyCallback callback, gpointer user_data)
+ {
+-  GTask * task;
++  g_autoptr(GTask) task = NULL;
+   ExtractSigfmData * data = g_new0 (ExtractSigfmData, 1);
+ 
+   task = g_task_new (self, cancellable, fp_image_sigfm_extract_cb, user_data);
+diff --git a/libfprint/sigfm/img-info.hpp b/libfprint/sigfm/img-info.hpp
+index bf270ec..0cc9f9e 100644
+--- a/libfprint/sigfm/img-info.hpp
++++ b/libfprint/sigfm/img-info.hpp
+@@ -1,4 +1,3 @@
+-
+ #pragma once
+ 
+ #include <opencv2/core.hpp>
+@@ -7,4 +6,5 @@
+ struct SigfmImgInfo {
+     std::vector<cv::KeyPoint> keypoints;
+     cv::Mat descriptors;
+-};
+\ No newline at end of file
++    cv::Mat norm_img;
++};
+diff --git a/libfprint/sigfm/meson.build b/libfprint/sigfm/meson.build
+index b04154d..170e15a 100644
+--- a/libfprint/sigfm/meson.build
++++ b/libfprint/sigfm/meson.build
+@@ -1,11 +1,14 @@
+ 
+ sigfm_sources = ['sigfm.cpp']
+ 
+-opencv = dependency('opencv4', required: true, version: '>=4.5.0')
++opencv = dependency('opencv4', required: false, version: '>=4.5.0')
++if not opencv.found()
++  opencv = dependency('opencv5', required: true, version: '>=5.0.0')
++endif
+ doctest = dependency('doctest', required: true, version: ['>=2.0.0', '<3.0.0'])
+ 
+ libsigfm = static_library('sigfm',
+         sigfm_sources,
+-        dependencies: [opencv],
+-)
++        dependencies: [opencv])
+ sigfm_tests = executable('sigfm-tests', ['./tests.cpp'], dependencies: [doctest, opencv], link_with: [libsigfm])
++test('sigfm-SiteTests', sigfm_tests)
+diff --git a/libfprint/sigfm/sigfm.cpp b/libfprint/sigfm/sigfm.cpp
+index 0781299..d5941a7 100644
+--- a/libfprint/sigfm/sigfm.cpp
++++ b/libfprint/sigfm/sigfm.cpp
+@@ -1,41 +1,21 @@
+-// SIGFM algorithm for libfprint
+-
++// SIGFM + Hybrid Rotated-ZNCC / SIFT-RANSAC matcher for ELAN7001 / eFSA80SC (80x80 SPI)
++//
+ // Copyright (C) 2022 Matthieu CHARETTE <matthieu.charette@gmail.com>
+ // Copyright (c) 2022 Natasha England-Elbro <ashenglandelbro@protonmail.com>
+ // Copyright (c) 2022 Timur Mangliev <tigrmango@gmail.com>
+-
+-// This library is free software; you can redistribute it and/or
+-// modify it under the terms of the GNU Lesser General Public
+-// License as published by the Free Software Foundation; either
+-// version 2.1 of the License, or (at your option) any later version.
+-
+-// This library is distributed in the hope that it will be useful,
+-// but WITHOUT ANY WARRANTY; without even the implied warranty of
+-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+-// Lesser General Public License for more details.
+-
+-// You should have received a copy of the GNU Lesser General Public
+-// License along with this library; if not, write to the Free Software
+-// Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ //
++// SPDX-License-Identifier: LGPL-2.1-or-later
+ 
+ #include "sigfm.hpp"
+ #include "binary.hpp"
+ #include "img-info.hpp"
+ 
+-#include "opencv2/core/persistence.hpp"
+-#include "opencv2/core/types.hpp"
+-#include "opencv2/features2d.hpp"
+-#include "opencv2/imgcodecs.hpp"
+-#include <algorithm>
+-#include <cstdio>
+-#include <filesystem>
+-#include <fstream>
+-#include <iterator>
+-#include <sstream>
+-#include <string>
+-
+ #include <opencv2/opencv.hpp>
++#include <opencv2/features2d.hpp>
++#include <algorithm>
++#include <cmath>
++#include <cstring>
++#include <memory>
+ #include <vector>
+ 
+ namespace bin {
+@@ -44,7 +24,7 @@ template<>
+ struct serializer<SigfmImgInfo> : public std::true_type {
+     static void serialize(const SigfmImgInfo& info, stream& out)
+     {
+-        out << info.keypoints << info.descriptors;
++        out << info.keypoints << info.descriptors << info.norm_img;
+     }
+ };
+ 
+@@ -54,50 +34,294 @@ struct deserializer<SigfmImgInfo> : public std::true_type {
+     {
+         SigfmImgInfo info;
+         in >> info.keypoints >> info.descriptors;
++        if (in.size() > 0) {
++            try {
++                in >> info.norm_img;
++            } catch (...) {
++                info.norm_img = cv::Mat();
++            }
++        }
+         return info;
+     }
+ };
++
+ } // namespace bin
+ 
+ namespace {
+-constexpr auto distance_match = 0.75;
+-constexpr auto length_match = 0.05;
+-constexpr auto angle_match = 0.05;
+-constexpr auto min_match = 5;
+-struct match {
+-    cv::Point2i p1;
+-    cv::Point2i p2;
+-    match(cv::Point2i ip1, cv::Point2i ip2) : p1{ip1}, p2{ip2} {}
+-    match() : p1{cv::Point2i(0, 0)}, p2{cv::Point2i(0, 0)} {}
+-    bool operator==(const match& right) const
+-    {
+-        return std::tie(this->p1, this->p2) == std::tie(right.p1, right.p2);
++
++static inline float wrap_deg(float d)
++{
++    while (d > 180.0f) d -= 360.0f;
++    while (d < -180.0f) d += 360.0f;
++    return d;
++}
++
++static inline cv::Mat make_rot_matrix(float cx, float cy, float ang_deg, float dx = 0.0f, float dy = 0.0f)
++{
++    double rad = ang_deg * M_PI / 180.0;
++    double alpha = std::cos(rad);
++    double beta = std::sin(rad);
++    cv::Mat M(2, 3, CV_64F);
++    M.at<double>(0, 0) = alpha;
++    M.at<double>(0, 1) = beta;
++    M.at<double>(0, 2) = (1.0 - alpha) * cx - beta * cy + dx;
++    M.at<double>(1, 0) = -beta;
++    M.at<double>(1, 1) = alpha;
++    M.at<double>(1, 2) = beta * cx + (1.0 - alpha) * cy + dy;
++    return M;
++}
++
++static float eval_zncc_at(const cv::Mat& a_flt, const cv::Mat& b_flt,
++                          float ang_deg, float dx, float dy,
++                          int min_overlap = 1200, float* raw_cc_out = nullptr)
++{
++    int w = a_flt.cols, h = a_flt.rows;
++    cv::Mat M = make_rot_matrix(w * 0.5f, h * 0.5f, ang_deg, dx, dy);
++    cv::Mat bw, mw;
++    cv::warpAffine(b_flt, bw, M, cv::Size(w, h), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0));
++    cv::warpAffine(cv::Mat::ones(h, w, CV_32F), mw, M, cv::Size(w, h), cv::INTER_NEAREST, cv::BORDER_CONSTANT, cv::Scalar(0));
++
++    double sa = 0, sb = 0, s2a = 0, s2b = 0, sab = 0;
++    int cnt = 0;
++    for (int y = 3; y < h - 3; y++) {
++        const float* pa = a_flt.ptr<float>(y);
++        const float* pb = bw.ptr<float>(y);
++        const float* pm = mw.ptr<float>(y);
++        for (int x = 3; x < w - 3; x++) {
++            if (pm[x] > 0.5f) {
++                float va = pa[x], vb = pb[x];
++                sa += va;
++                sb += vb;
++                s2a += va * va;
++                s2b += vb * vb;
++                sab += va * vb;
++                cnt++;
++            }
++        }
+     }
+-    bool operator<(const match& right) const
+-    {
+-        return (this->p1.y < right.p1.y) ||
+-               ((this->p1.y < right.p1.y) && this->p1.x < right.p1.x);
++    if (cnt < min_overlap) return -1.0f;
++    double ma = sa / cnt, mb = sb / cnt;
++    double va = s2a - cnt * ma * ma;
++    double vb = s2b - cnt * mb * mb;
++    if (va <= 1e-5 || vb <= 1e-5) return -1.0f;
++    float cc = static_cast<float>((sab - cnt * ma * mb) / std::sqrt(va * vb));
++    if (raw_cc_out) *raw_cc_out = cc;
++    float area_factor = std::sqrt(static_cast<float>(cnt) / ((w - 6) * (h - 6)));
++    return cc * area_factor;
++}
++
++static int count_pose_inliers(const SigfmImgInfo* a, const SigfmImgInfo* b,
++                              float ang_deg, float dx, float dy)
++{
++    if (a->descriptors.rows < 4 || b->descriptors.rows < 4) return 0;
++    float cx = a->norm_img.empty() ? 40.0f : (a->norm_img.cols * 0.5f);
++    float cy = a->norm_img.empty() ? 40.0f : (a->norm_img.rows * 0.5f);
++    float rad = -ang_deg * static_cast<float>(M_PI) / 180.0f;
++    float c = std::cos(rad), s = std::sin(rad);
++    auto bfm = cv::BFMatcher::create();
++    std::vector<std::vector<cv::DMatch>> knn;
++    bfm->knnMatch(a->descriptors, b->descriptors, knn, 2);
++    std::vector<cv::Point2f> used1, used2;
++    int inliers = 0;
++    for (const auto& m : knn) {
++        if (m.size() < 2) continue;
++        if (m[0].distance < 0.86f * m[1].distance) {
++            const auto& kp1 = a->keypoints[m[0].queryIdx];
++            const auto& kp2 = b->keypoints[m[0].trainIdx];
++            float sratio = kp1.size / kp2.size;
++            if (sratio < 0.72f || sratio > 1.39f) continue;
++            float da = wrap_deg((kp2.angle - ang_deg) - kp1.angle);
++            if (std::fabs(da) > 25.0f) continue;
++            float rx = c * (kp2.pt.x - cx) - s * (kp2.pt.y - cy) + cx + dx;
++            float ry = s * (kp2.pt.x - cx) + c * (kp2.pt.y - cy) + cy + dy;
++            if (std::hypot(rx - kp1.pt.x, ry - kp1.pt.y) < 3.2f) {
++                bool dup = false;
++                for (std::size_t k = 0; k < used1.size(); k++) {
++                    if (std::hypot(used1[k].x - kp1.pt.x, used1[k].y - kp1.pt.y) < 2.5f ||
++                        std::hypot(used2[k].x - kp2.pt.x, used2[k].y - kp2.pt.y) < 2.5f) {
++                        dup = true;
++                        break;
++                    }
++                }
++                if (!dup) {
++                    used1.push_back(kp1.pt);
++                    used2.push_back(kp2.pt);
++                    inliers++;
++                }
++            }
++        }
+     }
+-};
+-struct angle {
+-    double cos;
+-    double sin;
+-    match corr_matches[2];
+-    angle(double cos_, double sin_, match m1, match m2)
+-        : cos{cos_}, sin{sin_}, corr_matches{m1, m2}
+-    {
++    return inliers;
++}
++
++static int hybrid_match_oneway(const SigfmImgInfo* a, const SigfmImgInfo* b)
++{
++    struct Pose { float ang, dx, dy; };
++    std::vector<Pose> candidates;
++
++    bool has_imgs = !a->norm_img.empty() && !b->norm_img.empty() &&
++                    a->norm_img.cols == b->norm_img.cols &&
++                    a->norm_img.rows == b->norm_img.rows;
++
++    cv::Mat af, bf, af_half, bf_half;
++    if (has_imgs) {
++        a->norm_img.convertTo(af, CV_32F);
++        b->norm_img.convertTo(bf, CV_32F);
++        cv::resize(af, af_half, cv::Size(40, 40), 0, 0, cv::INTER_AREA);
++        cv::resize(bf, bf_half, cv::Size(40, 40), 0, 0, cv::INTER_AREA);
++
++        float best_coarse = -1.0f;
++        Pose best_cpose = {0.0f, 0.0f, 0.0f};
++        int w = 40, h = 40;
++        for (int ang = -28; ang <= 28; ang += 4) {
++            cv::Mat M = make_rot_matrix(20.0f, 20.0f, static_cast<float>(ang));
++            cv::Mat br, mr;
++            cv::warpAffine(bf_half, br, M, cv::Size(w, h), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0));
++            cv::warpAffine(cv::Mat::ones(h, w, CV_32F), mr, M, cv::Size(w, h), cv::INTER_NEAREST, cv::BORDER_CONSTANT, cv::Scalar(0));
++            for (int dy = -16; dy <= 16; dy += 1) {
++                int y1a = std::max(1, 1 + dy), y2a = std::min(h - 1, h - 1 + dy);
++                int y1b = y1a - dy;
++                int hh = y2a - y1a;
++                if (hh <= 10) continue;
++                for (int dx = -16; dx <= 16; dx += 1) {
++                    int x1a = std::max(1, 1 + dx), x2a = std::min(w - 1, w - 1 + dx);
++                    int x1b = x1a - dx;
++                    int ww = x2a - x1a;
++                    if (ww * hh < 450) continue;
++                    double sa = 0, sb = 0, s2a = 0, s2b = 0, sab = 0;
++                    int cnt = 0;
++                    for (int y = 0; y < hh; y++) {
++                        const float* pa = af_half.ptr<float>(y1a + y) + x1a;
++                        const float* pb = br.ptr<float>(y1b + y) + x1b;
++                        const float* pm = mr.ptr<float>(y1b + y) + x1b;
++                        for (int x = 0; x < ww; x++) {
++                            if (pm[x] > 0.5f) {
++                                float va = pa[x], vb = pb[x];
++                                sa += va;
++                                sb += vb;
++                                s2a += va * va;
++                                s2b += vb * vb;
++                                sab += va * vb;
++                                cnt++;
++                            }
++                        }
++                    }
++                    if (cnt < 450) continue;
++                    double ma = sa / cnt, mb = sb / cnt;
++                    double va = s2a - cnt * ma * ma;
++                    double vb = s2b - cnt * mb * mb;
++                    if (va <= 1e-5 || vb <= 1e-5) continue;
++                    float cc = static_cast<float>((sab - cnt * ma * mb) / std::sqrt(va * vb));
++                    float wcc = cc * std::sqrt(static_cast<float>(cnt) / ((w - 2) * (h - 2)));
++                    if (wcc > best_coarse) {
++                        best_coarse = wcc;
++                        best_cpose = {static_cast<float>(ang), static_cast<float>(dx * 2), static_cast<float>(dy * 2)};
++                    }
++                }
++            }
++        }
++        candidates.push_back(best_cpose);
+     }
+-};
++
++    if (a->descriptors.rows >= 4 && b->descriptors.rows >= 4) {
++        auto bfm = cv::BFMatcher::create();
++        std::vector<std::vector<cv::DMatch>> knn;
++        bfm->knnMatch(a->descriptors, b->descriptors, knn, 2);
++        struct Cand { cv::Point2f p1, p2; float da; };
++        std::vector<Cand> cand;
++        for (const auto& m : knn) {
++            if (m.size() < 2) continue;
++            if (m[0].distance < 0.86f * m[1].distance) {
++                const auto& kp1 = a->keypoints[m[0].queryIdx];
++                const auto& kp2 = b->keypoints[m[0].trainIdx];
++                float sratio = kp1.size / kp2.size;
++                if (sratio < 0.72f || sratio > 1.39f) continue;
++                cand.push_back({kp1.pt, kp2.pt, wrap_deg(kp2.angle - kp1.angle)});
++            }
++        }
++        float cx = has_imgs ? (af.cols * 0.5f) : 40.0f;
++        float cy = has_imgs ? (af.rows * 0.5f) : 40.0f;
++        int best_inl = 0;
++        Pose best_spose = {0.0f, 0.0f, 0.0f};
++        for (std::size_t i = 0; i < cand.size(); i++) {
++            for (int d_off : {-5, 0, 5}) {
++                float ang_deg = wrap_deg(cand[i].da + d_off);
++                if (std::fabs(ang_deg) > 35.0f) continue;
++                float rad = -ang_deg * static_cast<float>(M_PI) / 180.0f;
++                float c = std::cos(rad), s = std::sin(rad);
++                float rx = c * (cand[i].p2.x - cx) - s * (cand[i].p2.y - cy) + cx;
++                float ry = s * (cand[i].p2.x - cx) + c * (cand[i].p2.y - cy) + cy;
++                float dx = cand[i].p1.x - rx;
++                float dy = cand[i].p1.y - ry;
++                if (std::fabs(dx) > 45.0f || std::fabs(dy) > 45.0f) continue;
++                int inl = 0;
++                for (std::size_t j = 0; j < cand.size(); j++) {
++                    if (std::fabs(wrap_deg(cand[j].da - ang_deg)) > 25.0f) continue;
++                    float rjx = c * (cand[j].p2.x - cx) - s * (cand[j].p2.y - cy) + cx + dx;
++                    float rjy = s * (cand[j].p2.x - cx) + c * (cand[j].p2.y - cy) + cy + dy;
++                    if (std::hypot(rjx - cand[j].p1.x, rjy - cand[j].p1.y) < 3.2f) inl++;
++                }
++                if (inl > best_inl) {
++                    best_inl = inl;
++                    best_spose = {ang_deg, dx, dy};
++                }
++            }
++        }
++        if (best_inl >= 4) candidates.push_back(best_spose);
++    }
++
++    if (!has_imgs) {
++        int best_sift_only = 0;
++        for (const auto& cpose : candidates) {
++            int inl = count_pose_inliers(a, b, cpose.ang, cpose.dx, cpose.dy);
++            if (inl >= 6) best_sift_only = std::max(best_sift_only, inl * 80);
++        }
++        return best_sift_only;
++    }
++
++    int best_total_score = 0;
++    for (const auto& cpose : candidates) {
++        float best_wzncc = -1.0f, best_raw_cc = -1.0f;
++        Pose ref = cpose;
++        for (float da = -3.0f; da <= 3.0f; da += 1.5f) {
++            for (float ddy = -2.0f; ddy <= 2.0f; ddy += 1.0f) {
++                for (float ddx = -2.0f; ddx <= 2.0f; ddx += 1.0f) {
++                    float raw_cc = -1.0f;
++                    float wcc = eval_zncc_at(af, bf, cpose.ang + da, cpose.dx + ddx, cpose.dy + ddy, 1200, &raw_cc);
++                    if (wcc > best_wzncc) {
++                        best_wzncc = wcc;
++                        best_raw_cc = raw_cc;
++                        ref = {cpose.ang + da, cpose.dx + ddx, cpose.dy + ddy};
++                    }
++                }
++            }
++        }
++        int inliers = count_pose_inliers(a, b, ref.ang, ref.dx, ref.dy);
++        if (best_wzncc < 0.35f || best_raw_cc < 0.44f) continue;
++        if (inliers < 3 && best_wzncc < 0.50f) continue;
++        int sc = static_cast<int>((best_wzncc - 0.32f) * 1000.0f) + inliers * 60;
++        if (sc > best_total_score) best_total_score = sc;
++    }
++    return best_total_score;
++}
++
+ } // namespace
+ 
+-SigfmImgInfo* sigfm_copy_info(SigfmImgInfo* info) { return new SigfmImgInfo{*info}; }
++SigfmImgInfo* sigfm_copy_info(SigfmImgInfo* info)
++{
++    return new SigfmImgInfo{info->keypoints, info->descriptors.clone(), info->norm_img.clone()};
++}
++
++int sigfm_keypoints_count(SigfmImgInfo* info)
++{
++    return static_cast<int>(info->keypoints.size());
++}
+ 
+-int sigfm_keypoints_count(SigfmImgInfo* info) { return info->keypoints.size(); }
+ unsigned char* sigfm_serialize_binary(SigfmImgInfo* info, int* outlen)
+ {
+     bin::stream s;
+     s << *info;
+-    *outlen = s.size();
++    *outlen = static_cast<int>(s.size());
+     return s.copy_buffer();
+ }
+ 
+@@ -108,109 +332,69 @@ SigfmImgInfo* sigfm_deserialize_binary(const unsigned char* bytes, int len)
+         auto info = std::make_unique<SigfmImgInfo>();
+         s >> *info;
+         return info.release();
+-    }
+-    catch (const std::exception&) {
++    } catch (const std::exception&) {
+         return nullptr;
+     }
+ }
+ 
+ SigfmImgInfo* sigfm_extract(const SigfmPix* pix, int width, int height)
+ {
+-    cv::Mat img;
+-    img.create(height, width, CV_8UC1);
+-    std::memcpy(img.data, pix, width * height);
+-    const auto roi = cv::Mat::ones(cv::Size{img.size[1], img.size[0]}, CV_8UC1);
+-    std::vector<cv::KeyPoint> pts;
++    cv::Mat raw(height, width, CV_8UC1);
++    std::memcpy(raw.data, pix, width * height);
++    cv::Mat flt;
++    raw.convertTo(flt, CV_32F);
++
++    // 1. Suppress row-wise 50/60Hz common-mode mains hum and column-wise gradient
++    cv::Mat row_mean, col_mean;
++    cv::reduce(flt, row_mean, 1, cv::REDUCE_AVG);
++    for (int y = 0; y < height; y++) {
++        float rm = row_mean.at<float>(y, 0);
++        for (int x = 0; x < width; x++) flt.at<float>(y, x) -= rm;
++    }
++    cv::reduce(flt, col_mean, 0, cv::REDUCE_AVG);
++    for (int y = 0; y < height; y++) {
++        for (int x = 0; x < width; x++) flt.at<float>(y, x) -= col_mean.at<float>(0, x) * 0.5f;
++    }
+ 
++    // 2. Bandpass filter for fingerprint ridges and pores
++    cv::Mat low, high, bp;
++    cv::GaussianBlur(flt, low, cv::Size(0, 0), 0.8);
++    cv::GaussianBlur(flt, high, cv::Size(0, 0), 5.0);
++    bp = low - high;
++
++    // 3. Local contrast normalization
++    cv::Mat sq = bp.mul(bp), local_var;
++    cv::GaussianBlur(sq, local_var, cv::Size(0, 0), 8.0);
++    cv::Mat u8(height, width, CV_8UC1);
++    for (int y = 0; y < height; y++) {
++        for (int x = 0; x < width; x++) {
++            float sd = std::sqrt(local_var.at<float>(y, x) + 25.0f);
++            float v = 128.0f + (bp.at<float>(y, x) / sd) * 55.0f;
++            u8.at<unsigned char>(y, x) = static_cast<unsigned char>(std::clamp(v, 0.0f, 255.0f));
++        }
++    }
++
++    std::vector<cv::KeyPoint> pts;
+     cv::Mat descs;
+-    cv::SIFT::create()->detectAndCompute(img, roi, pts, descs);
++    auto sift = cv::SIFT::create(0, 3, 0.015, 12.0, 1.2);
++    sift->detectAndCompute(u8, cv::noArray(), pts, descs);
+ 
+-    auto* info = new SigfmImgInfo{pts, descs};
+-    return info;
++    return new SigfmImgInfo{pts, descs, u8};
+ }
+ 
+ int sigfm_match_score(SigfmImgInfo* frame, SigfmImgInfo* enrolled)
+ {
+     try {
+-        std::vector<std::vector<cv::DMatch>> points;
+-        auto bfm = cv::BFMatcher::create();
+-        bfm->knnMatch(frame->descriptors, enrolled->descriptors, points, 2);
+-        std::set<match> matches_unique;
+-        int nb_matched = 0;
+-        for (const auto& pts : points) {
+-            if (pts.size() < 2) {
+-                continue;
+-            }
+-            const cv::DMatch& match_1 = pts.at(0);
+-            if (match_1.distance < distance_match * pts.at(1).distance) {
+-                matches_unique.emplace(
+-                    match{frame->keypoints.at(match_1.queryIdx).pt,
+-                          enrolled->keypoints.at(match_1.trainIdx).pt});
+-                nb_matched++;
+-            }
+-        }
+-        if (nb_matched < min_match) {
+-            return 0;
+-        }
+-        std::vector<match> matches{matches_unique.begin(),
+-                                   matches_unique.end()};
+-
+-        std::vector<angle> angles;
+-        for (std::size_t j = 0; j < matches.size(); j++) {
+-            match match_1 = matches[j];
+-            for (std::size_t k = j + 1; k < matches.size(); k++) {
+-                match match_2 = matches[k];
+-
+-                int vec_1[2] = {match_1.p1.x - match_2.p1.x,
+-                                match_1.p1.y - match_2.p1.y};
+-                int vec_2[2] = {match_1.p2.x - match_2.p2.x,
+-                                match_1.p2.y - match_2.p2.y};
+-
+-                double length_1 = sqrt(pow(vec_1[0], 2) + pow(vec_1[1], 2));
+-                double length_2 = sqrt(pow(vec_2[0], 2) + pow(vec_2[1], 2));
+-
+-                if (1 - std::min(length_1, length_2) /
+-                            std::max(length_1, length_2) <=
+-                    length_match) {
+-
+-                    double product = length_1 * length_2;
+-                    angles.emplace_back(angle(
+-                        M_PI / 2 +
+-                            asin((vec_1[0] * vec_2[0] + vec_1[1] * vec_2[1]) /
+-                                 product),
+-                        acos((vec_1[0] * vec_2[1] - vec_1[1] * vec_2[0]) /
+-                             product),
+-                        match_1, match_2));
+-                }
+-            }
+-        }
+-
+-        if (angles.size() < min_match) {
+-            return 0;
+-        }
+-
+-        int count = 0;
+-        for (std::size_t j = 0; j < angles.size(); j++) {
+-            angle angle_1 = angles[j];
+-            for (std::size_t k = j + 1; k < angles.size(); k++) {
+-                angle angle_2 = angles[k];
+-
+-                if (1 - std::min(angle_1.sin, angle_2.sin) /
+-                                std::max(angle_1.sin, angle_2.sin) <=
+-                        angle_match &&
+-                    1 - std::min(angle_1.cos, angle_2.cos) /
+-                                std::max(angle_1.cos, angle_2.cos) <=
+-                        angle_match) {
+-
+-                    count += 1;
+-                }
+-            }
+-        }
+-        return count;
+-    }
+-    catch (...) {
++        if (!frame || !enrolled) return 0;
++        int s1 = hybrid_match_oneway(frame, enrolled);
++        int s2 = hybrid_match_oneway(enrolled, frame);
++        return std::max(s1, s2);
++    } catch (...) {
+         return -1;
+     }
+ }
+ 
+-void sigfm_free_info(SigfmImgInfo* info) { delete info; }
++void sigfm_free_info(SigfmImgInfo* info)
++{
++    delete info;
++}

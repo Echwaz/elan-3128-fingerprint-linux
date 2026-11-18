@@ -1,0 +1,1 @@
+ACTION=="add|change", SUBSYSTEM=="spi", ENV{MODALIAS}=="acpi:ELAN7001:", RUN{builtin}+="kmod load spi:spidev", RUN+="/bin/sh -c 'echo spidev > %S%p/driver_override; [ -e %S%p/driver ] || echo %k > %S%p/subsystem/drivers/spidev/bind'"
